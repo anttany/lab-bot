@@ -2,6 +2,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from bot.config import DEFAULT_LAB_SEATS
 from bot.models import Lab, Subject
 from bot.queue import as_utc
 from bot.schedule_source import ScheduleSource
@@ -34,7 +35,7 @@ async def sync_schedule(session: AsyncSession, source: ScheduleSource) -> tuple[
                 starts_at=starts_at,
                 classroom=draft.classroom,
                 teacher=draft.teacher,
-                max_seats=draft.max_seats,
+                max_seats=DEFAULT_LAB_SEATS,
             )
             session.add(lab)
             created += 1
@@ -43,7 +44,7 @@ async def sync_schedule(session: AsyncSession, source: ScheduleSource) -> tuple[
         lab.starts_at = starts_at
         lab.classroom = draft.classroom
         lab.teacher = draft.teacher
-        lab.max_seats = draft.max_seats
+        lab.max_seats = DEFAULT_LAB_SEATS
         lab.cancelled = False
         updated += 1
 

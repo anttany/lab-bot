@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import re
 from datetime import timedelta
 from uuid import uuid4
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart, Filter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from bot.config import Settings
+from bot.config import DEFAULT_LAB_SEATS, Settings
 from bot.jobs import (
     add_lab_job,
     close_signup,
@@ -20,13 +25,13 @@ from bot.jobs import (
     rebuild_jobs,
     require_runtime,
 )
-from bot.keyboards import labs_keyboard, signup_keyboard
+from bot.keyboards import labs_keyboard, seats_keyboard
 from bot.models import Lab, QueueEntry, Subject, User
-from bot.queue import as_utc, get_lab, join_queue, signup_is_open, utcnow
+from bot.queue import as_utc, get_lab, seat_count, signup_is_open, take_seat, utcnow
 from bot.schedule_source import build_schedule_source
 from bot.sync import sync_schedule
-from bot.texts import HELP, START, lab_card, queue_list
-from bot.users import resolve_group_chat_id, set_state
+from bot.texts import ASK_SURNAME, HELP, START, SURNAME_BAD, lab_card, queue_list
+from bot.users import has_surname, resolve_group_chat_id, set_state
 
 router = Router()
 admin_router = Router()
@@ -39,6 +44,29 @@ class AdminFilter(Filter):
 
 
 admin_router.message.filter(AdminFilter())
+
+SURNAME_RE = re.compile(r"^[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё\- ]{1,39}$")
+
+
+class Register(StatesGroup):
+    last_name = State()
+
+
+class NeedSurname(Filter):
+    async def __call__(self, event: Message | CallbackQuery, db_user: User) -> bool:
+        return not has_surname(db_user)
+
+
+def parse_surname(text: str) -> str | None:
+    cleaned = " ".join(text.split())
+    if not SURNAME_RE.fullmatch(cleaned):
+        return None
+    return cleaned
+
+
+async def _ask_surname(message: Message, state: FSMContext) -> None:
+    await state.set_state(Register.last_name)
+    await message.answer(ASK_SURNAME)
 
 
 def _upcoming_query():
@@ -68,10 +96,79 @@ async def _send_labs(message: Message, session: AsyncSession, settings: Settings
     )
 
 
+async def _show_seats(
+    query: CallbackQuery,
+    lab: Lab,
+    db_user: User,
+    settings: Settings,
+    *,
+    notice: str | None = None,
+) -> None:
+    if query.message is None:
+        return
+    text = f"{lab_card(lab, settings.tz)}\n\nВыберите свободное место:"
+    if notice:
+        text = f"{notice}\n\n{text}"
+    markup = seats_keyboard(lab, db_user.id) if signup_is_open(lab) else None
+    try:
+        await query.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    except TelegramBadRequest:
+        await query.message.answer(text, parse_mode="HTML", reply_markup=markup)
+
+
 @router.message(CommandStart())
-async def cmd_start(message: Message, session: AsyncSession, settings: Settings) -> None:
+async def cmd_start(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+    db_user: User,
+    state: FSMContext,
+) -> None:
+    if not has_surname(db_user):
+        await message.answer(START)
+        await _ask_surname(message, state)
+        return
+    await state.clear()
     await message.answer(START, parse_mode="HTML")
     await _send_labs(message, session, settings)
+
+
+@router.message(Command("surname"))
+async def cmd_surname(message: Message, state: FSMContext) -> None:
+    await _ask_surname(message, state)
+
+
+@router.message(Register.last_name, F.text)
+async def save_surname(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+    db_user: User,
+    state: FSMContext,
+) -> None:
+    if (message.text or "").startswith("/"):
+        await message.answer(ASK_SURNAME)
+        return
+    surname = parse_surname(message.text or "")
+    if surname is None:
+        await message.answer(SURNAME_BAD)
+        return
+    db_user.last_name = surname
+    await state.clear()
+    await message.answer(f"Фамилия сохранена: <b>{surname}</b>", parse_mode="HTML")
+    await _send_labs(message, session, settings)
+
+
+@router.message(NeedSurname())
+async def need_surname_message(message: Message, state: FSMContext) -> None:
+    await _ask_surname(message, state)
+
+
+@router.callback_query(NeedSurname())
+async def need_surname_callback(query: CallbackQuery, state: FSMContext) -> None:
+    await query.answer("Сначала напишите фамилию боту", show_alert=True)
+    if query.message:
+        await _ask_surname(query.message, state)
 
 
 @router.message(Command("help"))
@@ -109,8 +206,13 @@ async def cmd_my(message: Message, session: AsyncSession, db_user: User, setting
 
 
 @router.callback_query(F.data.startswith("signup:"))
-async def cb_signup(query: CallbackQuery, session: AsyncSession, db_user: User) -> None:
-    if query.data is None or query.message is None:
+async def cb_signup(
+    query: CallbackQuery,
+    session: AsyncSession,
+    db_user: User,
+    settings: Settings,
+) -> None:
+    if query.data is None:
         await query.answer()
         return
     lab_id = int(query.data.split(":", 1)[1])
@@ -118,25 +220,67 @@ async def cb_signup(query: CallbackQuery, session: AsyncSession, db_user: User) 
     if lab is None:
         await query.answer("Лабораторная не найдена", show_alert=True)
         return
-    status, place = await join_queue(session, lab, db_user)
+    if not signup_is_open(lab):
+        await query.answer("Запись сейчас закрыта", show_alert=True)
+        return
+    await query.answer()
+    await _show_seats(query, lab, db_user, settings)
+
+
+@router.callback_query(F.data.startswith("seat:"))
+async def cb_seat(
+    query: CallbackQuery,
+    session: AsyncSession,
+    db_user: User,
+    settings: Settings,
+) -> None:
+    if query.data is None:
+        await query.answer()
+        return
+    _, lab_id_raw, place_raw = query.data.split(":", 2)
+    lab = await get_lab(session, int(lab_id_raw))
+    if lab is None:
+        await query.answer("Лабораторная не найдена", show_alert=True)
+        return
+    try:
+        status, place = await take_seat(session, lab, db_user, int(place_raw))
+    except IntegrityError:
+        await session.rollback()
+        status, place = "taken", None
+    lab = await get_lab(session, lab.id) or lab
     if status == "ok":
-        await query.answer(f"Вы записаны: {place} место")
-        await query.message.answer(
-            f"Готово: <b>{place}</b> место на {lab.subject.name}.",
-            parse_mode="HTML",
-        )
+        await query.answer(f"Вы заняли {place} место")
+        await _show_seats(query, lab, db_user, settings, notice=f"Готово: <b>{place}</b> место.")
+        return
+    if status == "moved":
+        await query.answer(f"Пересели на {place} место")
+        await _show_seats(query, lab, db_user, settings, notice=f"Теперь вы на <b>{place}</b> месте.")
         return
     if status == "already":
-        await query.answer(f"Вы уже в очереди: {place} место")
+        await query.answer(f"Это уже ваше место: {place}")
         return
-    if status == "full":
-        await query.answer("Мест больше нет", show_alert=True)
+    if status == "taken":
+        await query.answer("Это место уже заняли", show_alert=True)
+        await _show_seats(query, lab, db_user, settings)
+        return
+    if status == "invalid":
+        await query.answer("Такого места нет", show_alert=True)
         return
     await query.answer("Запись сейчас закрыта", show_alert=True)
 
 
+@router.callback_query(F.data.startswith("busy:"))
+async def cb_busy(query: CallbackQuery) -> None:
+    await query.answer("Это место уже занято", show_alert=True)
+
+
 @router.callback_query(F.data.startswith("queue:"))
-async def cb_queue(query: CallbackQuery, session: AsyncSession, settings: Settings) -> None:
+async def cb_queue(
+    query: CallbackQuery,
+    session: AsyncSession,
+    settings: Settings,
+    db_user: User,
+) -> None:
     if query.data is None or query.message is None:
         await query.answer()
         return
@@ -147,9 +291,9 @@ async def cb_queue(query: CallbackQuery, session: AsyncSession, settings: Settin
         return
     await query.answer()
     await query.message.answer(
-        f"{lab_card(lab, settings.tz)}\n\n{queue_list(list(lab.queue_entries))}",
+        f"{lab_card(lab, settings.tz)}\n\n{queue_list(list(lab.queue_entries), seat_count(lab))}",
         parse_mode="HTML",
-        reply_markup=signup_keyboard(lab.id) if signup_is_open(lab) else None,
+        reply_markup=seats_keyboard(lab, db_user.id) if signup_is_open(lab) else None,
     )
 
 
@@ -187,7 +331,7 @@ async def cmd_test_lab(message: Message, session: AsyncSession, settings: Settin
         starts_at=now + timedelta(minutes=10),
         classroom="T-1",
         teacher="тест",
-        max_seats=8,
+        max_seats=DEFAULT_LAB_SEATS,
     )
     lab.subject = subject
     session.add(lab)

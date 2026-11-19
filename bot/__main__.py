@@ -4,8 +4,14 @@ import asyncio
 import logging
 from typing import Any, Awaitable, Callable
 
+from aiohttp import ClientSession
+from aiohttp.hdrs import USER_AGENT
+from aiohttp.http import SERVER_SOFTWARE
 from aiogram import BaseMiddleware, Bot, Dispatcher
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.__meta__ import __version__
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.types import BotCommand, TelegramObject, Update, User as TgUser
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -17,13 +23,32 @@ from bot.handlers import admin_router, router
 from bot.jobs import Runtime, rebuild_jobs, set_runtime
 from bot.schedule_source import build_schedule_source
 from bot.sync import sync_schedule
-from bot.users import set_state, upsert_user
+from bot.users import lock_for_user, set_state, upsert_user
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("labbot")
+
+
+class DirectTelegramSession(AiohttpSession):
+    """Сессия Telegram без прокси и без HTTP_PROXY/VPN из окружения."""
+
+    def __init__(self) -> None:
+        super().__init__(proxy=None)
+
+    async def create_session(self) -> ClientSession:
+        if self._should_reset_connector:
+            await self.close()
+        if self._session is None or self._session.closed:
+            self._session = ClientSession(
+                connector=self._connector_type(**self._connector_init),
+                headers={USER_AGENT: f"{SERVER_SOFTWARE} aiogram/{__version__}"},
+                trust_env=False,
+            )
+            self._should_reset_connector = False
+        return self._session
 
 
 class DbMiddleware(BaseMiddleware):
@@ -33,12 +58,18 @@ class DbMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: dict[str, Any],
     ) -> Any:
+        from_user = _user_from_event(event) or data.get("event_from_user")
         factory = get_session_factory()
-        async with factory() as session:
-            data["session"] = session
-            result = await handler(event, data)
-            await session.commit()
-            return result
+        async with lock_for_user(getattr(from_user, "id", None)):
+            async with factory() as session:
+                data["session"] = session
+                try:
+                    result = await handler(event, data)
+                    await session.commit()
+                    return result
+                except Exception:
+                    await session.rollback()
+                    raise
 
 
 def _user_from_event(event: TelegramObject) -> TgUser | None:
@@ -81,9 +112,10 @@ async def main() -> None:
 
     bot = Bot(
         token=settings.bot_token,
+        session=DirectTelegramSession(),
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-    dp = Dispatcher()
+    dp = Dispatcher(storage=MemoryStorage())
     dp["settings"] = settings
     dp.update.outer_middleware(DbMiddleware())
     dp.update.outer_middleware(UserMiddleware())
@@ -115,6 +147,7 @@ async def main() -> None:
             BotCommand(command="labs", description="Ближайшие лабораторные"),
             BotCommand(command="my", description="Мои записи"),
             BotCommand(command="help", description="Как работает запись"),
+            BotCommand(command="surname", description="Сменить фамилию"),
         ]
     )
     me = await bot.get_me()

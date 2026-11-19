@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from bot.config import DEFAULT_LAB_SEATS
 from bot.models import Lab, QueueEntry, User
 
 _locks: dict[int, asyncio.Lock] = {}
@@ -30,11 +32,16 @@ def as_utc(dt: datetime) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+def seat_count(_lab: Lab) -> int:
+    return DEFAULT_LAB_SEATS
+
+
 async def get_lab(session: AsyncSession, lab_id: int) -> Lab | None:
     result = await session.execute(
         select(Lab)
         .options(selectinload(Lab.subject), selectinload(Lab.queue_entries).selectinload(QueueEntry.user))
         .where(Lab.id == lab_id)
+        .execution_options(populate_existing=True)
     )
     return result.scalar_one_or_none()
 
@@ -48,33 +55,61 @@ def signup_is_open(lab: Lab, now: datetime | None = None) -> bool:
     return as_utc(lab.starts_at) > now
 
 
-async def join_queue(session: AsyncSession, lab: Lab, user: User) -> tuple[str, int | None]:
+def taken_places(lab: Lab) -> dict[int, QueueEntry]:
+    return {entry.place: entry for entry in lab.queue_entries}
+
+
+async def _assign_seat(
+    session: AsyncSession,
+    lab_id: int,
+    user_id: int,
+    place: int,
+) -> tuple[str, int | None]:
+    lab = await get_lab(session, lab_id)
+    if lab is None or not signup_is_open(lab):
+        return "closed", None
+    if place < 1 or place > seat_count(lab):
+        return "invalid", None
+
+    occupied = await session.scalar(
+        select(QueueEntry).where(
+            QueueEntry.lab_id == lab_id,
+            QueueEntry.place == place,
+        )
+    )
+    existing = await session.scalar(
+        select(QueueEntry).where(
+            QueueEntry.lab_id == lab_id,
+            QueueEntry.user_id == user_id,
+        )
+    )
+    if occupied is not None and occupied.user_id != user_id:
+        return "taken", None
+    if existing is not None and existing.place == place:
+        return "already", place
+    if existing is not None:
+        existing.place = place
+        existing.signed_at = utcnow()
+        await session.flush()
+        return "moved", place
+
+    session.add(QueueEntry(lab_id=lab_id, user_id=user_id, place=place))
+    await session.flush()
+    return "ok", place
+
+
+async def take_seat(
+    session: AsyncSession,
+    lab: Lab,
+    user: User,
+    place: int,
+) -> tuple[str, int | None]:
     async with _lock_for(lab.id):
-        await session.flush()
-        await session.refresh(
-            lab,
-            attribute_names=["opened_at", "closed_at", "cancelled", "starts_at", "max_seats"],
-        )
-        if not signup_is_open(lab):
-            return "closed", None
-
-        existing = await session.scalar(
-            select(QueueEntry).where(
-                QueueEntry.lab_id == lab.id,
-                QueueEntry.user_id == user.id,
-            )
-        )
-        if existing:
-            return "already", existing.place
-
-        taken = await session.scalar(
-            select(func.count()).select_from(QueueEntry).where(QueueEntry.lab_id == lab.id)
-        )
-        taken = int(taken or 0)
-        if lab.max_seats is not None and taken >= lab.max_seats:
-            return "full", None
-
-        entry = QueueEntry(lab_id=lab.id, user_id=user.id, place=taken + 1)
-        session.add(entry)
-        await session.flush()
-        return "ok", entry.place
+        try:
+            status, seat = await _assign_seat(session, lab.id, user.id, place)
+            if status in {"ok", "moved"}:
+                await session.commit()
+            return status, seat
+        except IntegrityError:
+            await session.rollback()
+            return "taken", None

@@ -4,6 +4,8 @@ from zoneinfo import ZoneInfo
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+DEFAULT_LAB_SEATS = 25
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -28,6 +30,7 @@ class Settings(BaseSettings):
     signup_open_before_hours: int = 24
     notify_before_open_minutes: int = 15
     post_after_open_minutes: int = 15
+    default_lab_seats: int = DEFAULT_LAB_SEATS
 
     @field_validator("group_chat_id", mode="before")
     @classmethod

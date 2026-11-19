@@ -13,7 +13,7 @@ from sqlalchemy.orm import selectinload
 
 from bot.config import Settings
 from bot.db import session_scope
-from bot.keyboards import signup_keyboard
+from bot.keyboards import seats_keyboard
 from bot.models import Lab, QueueEntry, User
 from bot.queue import as_utc, get_lab, utcnow
 from bot.texts import lab_card, queue_list
@@ -95,11 +95,11 @@ async def open_signup(lab_id: int) -> None:
         text = (
             "🟢 Запись открыта.\n\n"
             f"{lab_card(lab, ctx.settings.tz)}\n\n"
-            "Нажмите кнопку, чтобы занять место. "
+            "Выберите свободное место — всего 25. "
             f"Через {ctx.settings.post_after_open_minutes} мин. текущая очередь уйдёт в общую группу, "
             "но записаться можно до начала лабораторной."
         )
-        await _broadcast(ctx.bot, users, text, signup_keyboard(lab.id))
+        await _broadcast(ctx.bot, users, text, seats_keyboard(lab))
 
 
 async def post_queue(lab_id: int) -> None:
@@ -112,7 +112,7 @@ async def post_queue(lab_id: int) -> None:
         text = (
             "📋 Очередь на лабораторную\n\n"
             f"{lab_card(lab, ctx.settings.tz)}\n\n"
-            f"{queue_list(list(lab.queue_entries))}\n\n"
+            f"{queue_list(list(lab.queue_entries), lab.max_seats)}\n\n"
             f"Снимок через {ctx.settings.post_after_open_minutes} мин. после открытия записи. "
             "Дальше очередь ещё можно пополнить в боте."
         )

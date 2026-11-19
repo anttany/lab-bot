@@ -8,7 +8,7 @@ import httpx
 from mtuci_private_api import Mtuci
 from mtuci_private_api.http.client_factory.base_client import BaseHttpClientFactory
 
-from bot.config import Settings
+from bot.config import DEFAULT_LAB_SEATS, Settings
 from bot.schedule_source import LabDraft
 
 logger = logging.getLogger(__name__)
@@ -31,6 +31,7 @@ class ProxyHttpClientFactory(BaseHttpClientFactory):
             "headers": BROWSER_HEADERS,
             "follow_redirects": True,
             "timeout": 60.0,
+            "trust_env": False,
         }
         if self.proxy:
             kwargs["proxy"] = self.proxy
@@ -114,6 +115,7 @@ class MtuciScheduleSource:
             starts_at=starts_at,
             classroom=classrooms,
             teacher=teachers,
+            max_seats=DEFAULT_LAB_SEATS,
         )
 
 

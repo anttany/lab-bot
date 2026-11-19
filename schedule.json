@@ -6,7 +6,7 @@
       "starts_at": "2026-11-21T14:00:00+03:00",
       "classroom": "301",
       "teacher": "Иванов И.И.",
-      "max_seats": 12
+      "max_seats": 25
     },
     {
       "id": "oop-2026-11-24-1015",
@@ -14,7 +14,7 @@
       "starts_at": "2026-11-24T10:15:00+03:00",
       "classroom": "415",
       "teacher": "Петрова А.С.",
-      "max_seats": 10
+      "max_seats": 25
     }
   ]
 }
