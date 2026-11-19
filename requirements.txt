@@ -1,0 +1,10 @@
+aiogram>=3.15,<4
+sqlalchemy[asyncio]>=2.0.36,<3
+aiosqlite>=0.20
+apscheduler>=3.10,<4
+pydantic-settings>=2.6
+python-dotenv>=1.0
+tzdata>=2024.1
+httpx[socks]>=0.27
+socksio>=1.0
+mtuci-private-api>=0.1.2,<0.2
