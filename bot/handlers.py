@@ -4,12 +4,12 @@ import re
 from datetime import timedelta
 from uuid import uuid4
 
-from aiogram import F, Router
+from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart, Filter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, ChatMemberUpdated, Message
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,6 +35,11 @@ from bot.users import has_surname, resolve_group_chat_id, set_state
 
 router = Router()
 admin_router = Router()
+group_router = Router()
+
+router.message.filter(F.chat.type == "private")
+router.callback_query.filter(F.message.chat.type == "private")
+admin_router.message.filter(F.chat.type == "private")
 
 
 class AdminFilter(Filter):
@@ -131,6 +136,24 @@ async def cmd_start(
     await state.clear()
     await message.answer(START, parse_mode="HTML")
     await _send_labs(message, session, settings)
+
+
+@group_router.my_chat_member()
+async def on_bot_chat_member(event: ChatMemberUpdated, session: AsyncSession, bot: Bot) -> None:
+    if event.chat.type not in {"group", "supergroup"}:
+        return
+    if event.new_chat_member.user.id != bot.id:
+        return
+    if event.new_chat_member.status not in {"member", "administrator"}:
+        return
+    await set_state(session, "group_chat_id", str(event.chat.id))
+    try:
+        await bot.send_message(
+            event.chat.id,
+            "Группа привязана. Очередь на лабораторные будет приходить сюда.",
+        )
+    except TelegramBadRequest:
+        pass
 
 
 @router.message(Command("surname"))
@@ -295,15 +318,6 @@ async def cb_queue(
         parse_mode="HTML",
         reply_markup=seats_keyboard(lab, db_user.id) if signup_is_open(lab) else None,
     )
-
-
-@admin_router.message(Command("bind"))
-async def cmd_bind(message: Message, session: AsyncSession) -> None:
-    if message.chat.type not in {"group", "supergroup"}:
-        await message.answer("Отправьте /bind в общей группе, куда публиковать очередь.")
-        return
-    await set_state(session, "group_chat_id", str(message.chat.id))
-    await message.answer(f"Группа привязана. id: <code>{message.chat.id}</code>", parse_mode="HTML")
 
 
 @admin_router.message(Command("sync"))

@@ -120,7 +120,7 @@ async def post_queue(lab_id: int) -> None:
             admins = await session.scalars(
                 select(User).where(User.tg_id.in_(ctx.settings.admins), User.is_active.is_(True))
             )
-            warn = "Не привязана общая группа. Добавьте бота в чат и отправьте /bind.\n\n" + text
+            warn = "Не привязана общая группа. Добавьте бота в учебный чат — группа привяжется сама.\n\n" + text
             await _broadcast(ctx.bot, list(admins), warn)
         else:
             try:
@@ -204,7 +204,8 @@ async def rebuild_jobs() -> None:
                 else:
                     lab.opened_at = now
             if now >= post_at and now < starts and lab.posted_at is None:
-                pending_post.append(lab.id)
+                if now - post_at <= timedelta(minutes=3):
+                    pending_post.append(lab.id)
 
     for lab_id in pending_notify:
         await notify_signup(lab_id)

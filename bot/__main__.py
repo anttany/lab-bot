@@ -13,13 +13,20 @@ from aiogram.__meta__ import __version__
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
-from aiogram.types import BotCommand, TelegramObject, Update, User as TgUser
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
+    TelegramObject,
+    Update,
+    User as TgUser,
+)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import get_settings
 from bot.db import get_session_factory, init_db, session_scope
-from bot.handlers import admin_router, router
+from bot.handlers import admin_router, group_router, router
 from bot.jobs import Runtime, rebuild_jobs, set_runtime
 from bot.schedule_source import build_schedule_source
 from bot.sync import sync_schedule
@@ -119,6 +126,7 @@ async def main() -> None:
     dp["settings"] = settings
     dp.update.outer_middleware(DbMiddleware())
     dp.update.outer_middleware(UserMiddleware())
+    dp.include_router(group_router)
     dp.include_router(admin_router)
     dp.include_router(router)
 
@@ -141,6 +149,8 @@ async def main() -> None:
     scheduler.start()
     await rebuild_jobs()
 
+    await bot.delete_my_commands()
+    await bot.delete_my_commands(scope=BotCommandScopeAllGroupChats())
     await bot.set_my_commands(
         [
             BotCommand(command="start", description="Начать работу"),
@@ -148,8 +158,10 @@ async def main() -> None:
             BotCommand(command="my", description="Мои записи"),
             BotCommand(command="help", description="Как работает запись"),
             BotCommand(command="surname", description="Сменить фамилию"),
-        ]
+        ],
+        scope=BotCommandScopeAllPrivateChats(),
     )
+    await bot.set_my_commands([], scope=BotCommandScopeAllGroupChats())
     me = await bot.get_me()
     logger.info("Бот запущен как @%s", me.username)
     await dp.start_polling(bot)
