@@ -13,10 +13,11 @@ from sqlalchemy.orm import selectinload
 
 from bot.config import Settings
 from bot.db import session_scope
-from bot.keyboards import seats_keyboard
+from bot.itip import has_dual_queues
+from bot.keyboards import signup_keyboard
 from bot.models import Lab, QueueEntry, User
 from bot.queue import as_utc, get_lab, utcnow
-from bot.texts import lab_card, queue_list
+from bot.texts import lab_card, queues_text
 from bot.users import resolve_group_chat_id
 
 JOB_PREFIXES = ("notify", "open", "post", "close")
@@ -75,10 +76,13 @@ async def notify_signup(lab_id: int) -> None:
         users = await _active_users(session)
         minutes = ctx.settings.notify_before_open_minutes
         hours = ctx.settings.signup_open_before_hours
+        extra = ""
+        if has_dual_queues(lab, ctx.settings.tz):
+            extra = " На ИТиП две очереди: можно записаться и на текущую лабу, и на старые."
         text = (
             f"⏰ Через {minutes} мин. откроется запись на лабораторную.\n\n"
             f"{lab_card(lab, ctx.settings.tz)}\n\n"
-            f"Запись откроется за {hours} ч. до начала и будет идти до самой лабы."
+            f"Запись откроется за {hours} ч. до начала и будет идти до самой лабы.{extra}"
         )
         await _broadcast(ctx.bot, users, text)
         lab.notified_at = utcnow()
@@ -92,14 +96,19 @@ async def open_signup(lab_id: int) -> None:
             return
         lab.opened_at = utcnow()
         users = await _active_users(session)
+        seats_note = (
+            "Две очереди по 25 мест: сначала текущая лаба, затем старые. Можно занять обе."
+            if has_dual_queues(lab, ctx.settings.tz)
+            else "Выберите свободное место — всего 25."
+        )
         text = (
             "🟢 Запись открыта.\n\n"
             f"{lab_card(lab, ctx.settings.tz)}\n\n"
-            "Выберите свободное место — всего 25. "
+            f"{seats_note} "
             f"Через {ctx.settings.post_after_open_minutes} мин. текущая очередь уйдёт в общую группу, "
             "но записаться можно до начала лабораторной."
         )
-        await _broadcast(ctx.bot, users, text, seats_keyboard(lab))
+        await _broadcast(ctx.bot, users, text, signup_keyboard(lab))
 
 
 async def post_queue(lab_id: int) -> None:
@@ -112,7 +121,7 @@ async def post_queue(lab_id: int) -> None:
         text = (
             "📋 Очередь на лабораторную\n\n"
             f"{lab_card(lab, ctx.settings.tz)}\n\n"
-            f"{queue_list(list(lab.queue_entries), lab.max_seats)}\n\n"
+            f"{queues_text(lab, ctx.settings.tz)}\n\n"
             f"Снимок через {ctx.settings.post_after_open_minutes} мин. после открытия записи. "
             "Дальше очередь ещё можно пополнить в боте."
         )

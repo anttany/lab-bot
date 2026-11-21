@@ -39,9 +39,47 @@ async def init_db(settings: Settings) -> async_sessionmaker[AsyncSession]:
     _configure_sqlite(engine.sync_engine)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_migrate_queue_kind)
         await conn.execute(text("PRAGMA journal_mode=WAL"))
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     return session_factory
+
+
+def _migrate_queue_kind(connection) -> None:
+    rows = connection.execute(text("PRAGMA table_info(queue_entries)")).fetchall()
+    names = {row[1] for row in rows}
+    if not names or "queue_kind" in names:
+        return
+    connection.execute(
+        text(
+            """
+            CREATE TABLE queue_entries_new (
+                id INTEGER PRIMARY KEY,
+                lab_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                place INTEGER NOT NULL,
+                queue_kind VARCHAR(16) NOT NULL DEFAULT 'main',
+                signed_at DATETIME NOT NULL,
+                FOREIGN KEY(lab_id) REFERENCES labs(id),
+                FOREIGN KEY(user_id) REFERENCES users(id),
+                UNIQUE(lab_id, user_id, queue_kind),
+                UNIQUE(lab_id, queue_kind, place)
+            )
+            """
+        )
+    )
+    connection.execute(
+        text(
+            """
+            INSERT INTO queue_entries_new (id, lab_id, user_id, place, queue_kind, signed_at)
+            SELECT id, lab_id, user_id, place, 'main', signed_at FROM queue_entries
+            """
+        )
+    )
+    connection.execute(text("DROP TABLE queue_entries"))
+    connection.execute(text("ALTER TABLE queue_entries_new RENAME TO queue_entries"))
+    connection.execute(text("CREATE INDEX ix_queue_entries_lab_id ON queue_entries(lab_id)"))
+    connection.execute(text("CREATE INDEX ix_queue_entries_user_id ON queue_entries(user_id)"))
 
 
 def get_session_factory() -> async_sessionmaker[AsyncSession]:

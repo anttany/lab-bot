@@ -55,8 +55,8 @@ def signup_is_open(lab: Lab, now: datetime | None = None) -> bool:
     return as_utc(lab.starts_at) > now
 
 
-def taken_places(lab: Lab) -> dict[int, QueueEntry]:
-    return {entry.place: entry for entry in lab.queue_entries}
+def taken_places(lab: Lab, kind: str = "main") -> dict[int, QueueEntry]:
+    return {entry.place: entry for entry in lab.queue_entries if entry.queue_kind == kind}
 
 
 async def _assign_seat(
@@ -64,6 +64,7 @@ async def _assign_seat(
     lab_id: int,
     user_id: int,
     place: int,
+    kind: str,
 ) -> tuple[str, int | None]:
     lab = await get_lab(session, lab_id)
     if lab is None or not signup_is_open(lab):
@@ -74,12 +75,14 @@ async def _assign_seat(
     occupied = await session.scalar(
         select(QueueEntry).where(
             QueueEntry.lab_id == lab_id,
+            QueueEntry.queue_kind == kind,
             QueueEntry.place == place,
         )
     )
     existing = await session.scalar(
         select(QueueEntry).where(
             QueueEntry.lab_id == lab_id,
+            QueueEntry.queue_kind == kind,
             QueueEntry.user_id == user_id,
         )
     )
@@ -93,7 +96,7 @@ async def _assign_seat(
         await session.flush()
         return "moved", place
 
-    session.add(QueueEntry(lab_id=lab_id, user_id=user_id, place=place))
+    session.add(QueueEntry(lab_id=lab_id, user_id=user_id, place=place, queue_kind=kind))
     await session.flush()
     return "ok", place
 
@@ -103,10 +106,11 @@ async def take_seat(
     lab: Lab,
     user: User,
     place: int,
+    kind: str = "main",
 ) -> tuple[str, int | None]:
     async with _lock_for(lab.id):
         try:
-            status, seat = await _assign_seat(session, lab.id, user.id, place)
+            status, seat = await _assign_seat(session, lab.id, user.id, place, kind)
             if status in {"ok", "moved"}:
                 await session.commit()
             return status, seat

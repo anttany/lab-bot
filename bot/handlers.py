@@ -25,12 +25,13 @@ from bot.jobs import (
     rebuild_jobs,
     require_runtime,
 )
-from bot.keyboards import labs_keyboard, seats_keyboard
+from bot.itip import default_kind, has_dual_queues, spec_by_kind
+from bot.keyboards import labs_keyboard, queues_keyboard, seats_keyboard
 from bot.models import Lab, QueueEntry, Subject, User
-from bot.queue import as_utc, get_lab, seat_count, signup_is_open, take_seat, utcnow
+from bot.queue import as_utc, get_lab, signup_is_open, take_seat, utcnow
 from bot.schedule_source import build_schedule_source
 from bot.sync import sync_schedule
-from bot.texts import ASK_SURNAME, HELP, START, SURNAME_BAD, lab_card, queue_list
+from bot.texts import ASK_SURNAME, HELP, START, SURNAME_BAD, lab_card, queues_text
 from bot.users import has_surname, resolve_group_chat_id, set_state
 
 router = Router()
@@ -80,7 +81,7 @@ def _upcoming_query():
         .options(selectinload(Lab.subject), selectinload(Lab.queue_entries).selectinload(QueueEntry.user))
         .where(Lab.cancelled.is_(False), Lab.starts_at > utcnow())
         .order_by(Lab.starts_at)
-        .limit(12)
+        .limit(24)
     )
 
 
@@ -101,24 +102,55 @@ async def _send_labs(message: Message, session: AsyncSession, settings: Settings
     )
 
 
+async def _edit_or_send(query: CallbackQuery, text: str, markup) -> None:
+    if query.message is None:
+        return
+    try:
+        await query.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    except TelegramBadRequest:
+        await query.message.answer(text, parse_mode="HTML", reply_markup=markup)
+
+
+async def _show_queue_picker(
+    query: CallbackQuery,
+    lab: Lab,
+    settings: Settings,
+    *,
+    notice: str | None = None,
+) -> None:
+    text = (
+        f"{lab_card(lab, settings.tz)}\n\n"
+        "Две очереди на это занятие. Можно записаться в обе: "
+        "сначала сдают текущую лабу, затем старые."
+    )
+    if notice:
+        text = f"{notice}\n\n{text}"
+    markup = queues_keyboard(lab) if signup_is_open(lab) else None
+    await _edit_or_send(query, text, markup)
+
+
 async def _show_seats(
     query: CallbackQuery,
     lab: Lab,
     db_user: User,
     settings: Settings,
+    kind: str,
     *,
     notice: str | None = None,
 ) -> None:
-    if query.message is None:
-        return
-    text = f"{lab_card(lab, settings.tz)}\n\nВыберите свободное место:"
+    spec = spec_by_kind(lab, kind, settings.tz)
+    if spec is None:
+        if has_dual_queues(lab, settings.tz):
+            await _show_queue_picker(query, lab, settings)
+            return
+        kind = default_kind(lab, settings.tz)
+        spec = spec_by_kind(lab, kind, settings.tz)
+    title = spec.title if spec else "Очередь"
+    text = f"{lab_card(lab, settings.tz)}\n\n<b>{title}</b>\nВыберите свободное место:"
     if notice:
         text = f"{notice}\n\n{text}"
-    markup = seats_keyboard(lab, db_user.id) if signup_is_open(lab) else None
-    try:
-        await query.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
-    except TelegramBadRequest:
-        await query.message.answer(text, parse_mode="HTML", reply_markup=markup)
+    markup = seats_keyboard(lab, db_user.id, kind) if signup_is_open(lab) else None
+    await _edit_or_send(query, text, markup)
 
 
 @router.message(CommandStart())
@@ -221,10 +253,12 @@ async def cmd_my(message: Message, session: AsyncSession, db_user: User, setting
     if not live:
         await message.answer("Вы пока никуда не записаны. Откройте /labs.")
         return
-    live.sort(key=lambda entry: entry.lab.starts_at)
+    live.sort(key=lambda entry: (entry.lab.starts_at, entry.queue_kind, entry.place))
     lines = ["<b>Ваши записи</b>\n"]
     for entry in live:
-        lines.append(f"{entry.place} место · {lab_card(entry.lab, settings.tz)}\n")
+        spec = spec_by_kind(entry.lab, entry.queue_kind, settings.tz)
+        queue_label = f" · {spec.short}" if spec and has_dual_queues(entry.lab, settings.tz) else ""
+        lines.append(f"{entry.place} место{queue_label}\n{lab_card(entry.lab, settings.tz)}\n")
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
@@ -247,7 +281,35 @@ async def cb_signup(
         await query.answer("Запись сейчас закрыта", show_alert=True)
         return
     await query.answer()
-    await _show_seats(query, lab, db_user, settings)
+    if has_dual_queues(lab, settings.tz):
+        await _show_queue_picker(query, lab, settings)
+        return
+    await _show_seats(query, lab, db_user, settings, default_kind(lab, settings.tz))
+
+
+@router.callback_query(F.data.startswith("qpick:"))
+async def cb_queue_pick(
+    query: CallbackQuery,
+    session: AsyncSession,
+    db_user: User,
+    settings: Settings,
+) -> None:
+    if query.data is None:
+        await query.answer()
+        return
+    _, lab_id_raw, kind = query.data.split(":", 2)
+    lab = await get_lab(session, int(lab_id_raw))
+    if lab is None:
+        await query.answer("Лабораторная не найдена", show_alert=True)
+        return
+    if spec_by_kind(lab, kind, settings.tz) is None:
+        await query.answer("Такой очереди нет", show_alert=True)
+        return
+    if not signup_is_open(lab):
+        await query.answer("Запись сейчас закрыта", show_alert=True)
+        return
+    await query.answer()
+    await _show_seats(query, lab, db_user, settings, kind)
 
 
 @router.callback_query(F.data.startswith("seat:"))
@@ -260,31 +322,60 @@ async def cb_seat(
     if query.data is None:
         await query.answer()
         return
-    _, lab_id_raw, place_raw = query.data.split(":", 2)
+    parts = query.data.split(":")
+    if len(parts) == 4:
+        _, lab_id_raw, kind, place_raw = parts
+    elif len(parts) == 3:
+        _, lab_id_raw, place_raw = parts
+        kind = ""
+    else:
+        await query.answer()
+        return
     lab = await get_lab(session, int(lab_id_raw))
     if lab is None:
         await query.answer("Лабораторная не найдена", show_alert=True)
         return
+    if not kind:
+        kind = default_kind(lab, settings.tz)
+    if spec_by_kind(lab, kind, settings.tz) is None:
+        await query.answer("Такой очереди нет", show_alert=True)
+        return
     try:
-        status, place = await take_seat(session, lab, db_user, int(place_raw))
+        status, place = await take_seat(session, lab, db_user, int(place_raw), kind)
     except IntegrityError:
         await session.rollback()
         status, place = "taken", None
     lab = await get_lab(session, lab.id) or lab
+    spec = spec_by_kind(lab, kind, settings.tz)
+    queue_note = f" ({spec.short})" if spec and has_dual_queues(lab, settings.tz) else ""
     if status == "ok":
-        await query.answer(f"Вы заняли {place} место")
-        await _show_seats(query, lab, db_user, settings, notice=f"Готово: <b>{place}</b> место.")
+        await query.answer(f"Вы заняли {place} место{queue_note}")
+        await _show_seats(
+            query,
+            lab,
+            db_user,
+            settings,
+            kind,
+            notice=f"Готово: <b>{place}</b> место{queue_note}.",
+        )
         return
     if status == "moved":
-        await query.answer(f"Пересели на {place} место")
-        await _show_seats(query, lab, db_user, settings, notice=f"Теперь вы на <b>{place}</b> месте.")
+        await query.answer(f"Пересели на {place} место{queue_note}")
+        await _show_seats(
+            query,
+            lab,
+            db_user,
+            settings,
+            kind,
+            notice=f"Теперь вы на <b>{place}</b> месте{queue_note}.",
+        )
         return
     if status == "already":
         await query.answer(f"Это уже ваше место: {place}")
         return
     if status == "taken":
         await query.answer("Это место уже заняли", show_alert=True)
-        await _show_seats(query, lab, db_user, settings)
+        await _show_seats(query, lab, db_user, settings, kind)
         return
     if status == "invalid":
         await query.answer("Такого места нет", show_alert=True)
@@ -313,10 +404,13 @@ async def cb_queue(
         await query.answer("Лабораторная не найдена", show_alert=True)
         return
     await query.answer()
+    markup = None
+    if signup_is_open(lab):
+        markup = queues_keyboard(lab) if has_dual_queues(lab, settings.tz) else seats_keyboard(lab, db_user.id)
     await query.message.answer(
-        f"{lab_card(lab, settings.tz)}\n\n{queue_list(list(lab.queue_entries), seat_count(lab))}",
+        f"{lab_card(lab, settings.tz)}\n\n{queues_text(lab, settings.tz)}",
         parse_mode="HTML",
-        reply_markup=seats_keyboard(lab, db_user.id) if signup_is_open(lab) else None,
+        reply_markup=markup,
     )
 
 

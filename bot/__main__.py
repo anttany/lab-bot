@@ -29,6 +29,7 @@ from bot.db import get_session_factory, init_db, session_scope
 from bot.handlers import admin_router, group_router, router
 from bot.jobs import Runtime, rebuild_jobs, set_runtime
 from bot.schedule_source import build_schedule_source
+from bot.itip import ensure_itip_labs
 from bot.sync import sync_schedule
 from bot.users import lock_for_user, set_state, upsert_user
 
@@ -111,6 +112,12 @@ async def periodic_sync() -> None:
         await rebuild_jobs()
     except Exception:
         logger.exception("Не удалось обновить расписание")
+        try:
+            async with session_scope() as session:
+                await ensure_itip_labs(session, settings.tz)
+            await rebuild_jobs()
+        except Exception:
+            logger.exception("Не удалось добавить занятия ИТиП")
 
 
 async def main() -> None:
@@ -142,8 +149,12 @@ async def main() -> None:
             await sync_schedule(session, build_schedule_source(settings))
     except FileNotFoundError:
         logger.warning("Файл расписания не найден: %s", settings.schedule_path)
+        async with session_scope() as session:
+            await ensure_itip_labs(session, settings.tz)
     except Exception:
         logger.exception("Первичная загрузка расписания не удалась")
+        async with session_scope() as session:
+            await ensure_itip_labs(session, settings.tz)
 
     scheduler.add_job(periodic_sync, "interval", hours=1, id="schedule-sync", replace_existing=True)
     scheduler.start()

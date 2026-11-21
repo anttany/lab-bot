@@ -3,6 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from bot.config import DEFAULT_LAB_SEATS
+from bot.itip import CALENDAR_ID_PREFIX, ensure_itip_labs
 from bot.models import Lab, QueueEntry, Subject
 from bot.queue import as_utc
 from bot.schedule_source import LabDraft, ScheduleSource
@@ -110,12 +111,13 @@ async def sync_schedule(session: AsyncSession, source: ScheduleSource) -> tuple[
         select(Lab).options(selectinload(Lab.subject)).where(Lab.cancelled.is_(False))
     )
     for lab in existing:
-        if lab.external_id.startswith("test-"):
+        if lab.external_id.startswith("test-") or lab.external_id.startswith(CALENDAR_ID_PREFIX):
             continue
         key = (lab.subject_id, as_utc(lab.starts_at))
         if lab.external_id not in seen_external and key not in seen_keys:
             lab.cancelled = True
             updated += 1
 
+    created += await ensure_itip_labs(session)
     await session.flush()
     return created, updated

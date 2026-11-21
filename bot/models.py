@@ -84,14 +84,15 @@ class Lab(Base):
 class QueueEntry(Base):
     __tablename__ = "queue_entries"
     __table_args__ = (
-        UniqueConstraint("lab_id", "user_id"),
-        UniqueConstraint("lab_id", "place"),
+        UniqueConstraint("lab_id", "user_id", "queue_kind"),
+        UniqueConstraint("lab_id", "queue_kind", "place"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     lab_id: Mapped[int] = mapped_column(ForeignKey("labs.id"), index=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     place: Mapped[int] = mapped_column(Integer)
+    queue_kind: Mapped[str] = mapped_column(String(16), default="main")
     signed_at: Mapped[datetime] = mapped_column(
         UTCDateTime, default=utcnow
     )

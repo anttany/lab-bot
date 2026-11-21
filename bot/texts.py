@@ -2,6 +2,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from bot.config import DEFAULT_LAB_SEATS
+from bot.itip import entries_for, itip_session_for, queue_specs
 from bot.models import Lab, QueueEntry, User
 
 WEEKDAYS = (
@@ -49,7 +50,14 @@ def lab_card(lab: Lab, tz: ZoneInfo) -> str:
         lines.append(f"📍 ауд. {lab.classroom}")
     if lab.teacher:
         lines.append(f"👤 {lab.teacher}")
-    lines.append(f"🪑 мест: {lab.max_seats or DEFAULT_LAB_SEATS}")
+    session = itip_session_for(lab, tz)
+    if session is not None:
+        specs = queue_specs(lab, tz)
+        lines.append(session.headline)
+        lines.append(f"Сначала {specs[0].short}, затем {specs[1].short}")
+        lines.append(f"🪑 по {lab.max_seats or DEFAULT_LAB_SEATS} мест в каждой очереди")
+    else:
+        lines.append(f"🪑 мест: {lab.max_seats or DEFAULT_LAB_SEATS}")
     return "\n".join(lines)
 
 
@@ -66,12 +74,23 @@ def queue_list(entries: list[QueueEntry], max_seats: int | None = None) -> str:
     return "\n".join(lines)
 
 
+def queues_text(lab: Lab, tz: ZoneInfo) -> str:
+    specs = queue_specs(lab, tz)
+    blocks = []
+    for spec in specs:
+        title = spec.title if len(specs) > 1 else "Очередь"
+        blocks.append(f"<b>{title}</b>\n{queue_list(entries_for(lab, spec.kind), lab.max_seats)}")
+    return "\n\n".join(blocks)
+
+
 HELP = (
     "Бот записывает на лабораторные.\n\n"
     "За 15 минут до открытия записи придёт напоминание. "
     "Сама запись открывается за 24 часа до лабы и идёт до её начала. "
     "На каждой лабе 25 мест — выбираете свободное сами. "
     "Через 15 минут после открытия текущая очередь уходит в общую группу.\n\n"
+    "На ИТиП у занятия две очереди: сначала текущая лаба до дедлайна, "
+    "потом старые. Можно записаться в обе.\n\n"
     "/labs — ближайшие лабораторные\n"
     "/my — мои записи\n"
     "/surname — сменить фамилию"
