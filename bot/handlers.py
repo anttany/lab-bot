@@ -5,11 +5,11 @@ from datetime import timedelta
 from uuid import uuid4
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandStart, Filter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, ChatMemberUpdated, Message
+from aiogram.types import CallbackQuery, ChatMemberUpdated, InlineKeyboardMarkup, Message
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,12 +26,51 @@ from bot.jobs import (
     require_runtime,
 )
 from bot.itip import default_kind, has_dual_queues, spec_by_kind
-from bot.keyboards import labs_keyboard, queues_keyboard, seats_keyboard
-from bot.models import Lab, QueueEntry, Subject, User
-from bot.queue import as_utc, get_lab, signup_is_open, take_seat, utcnow
+from bot.keyboards import invite_keyboard, labs_keyboard, queues_keyboard, seats_keyboard
+from bot.models import Lab, QueueEntry, SeatInvite, Subject, User
+from bot.queue import (
+    accept_invite,
+    as_utc,
+    cancel_invite,
+    create_invite,
+    decline_invite,
+    get_lab,
+    signup_is_open,
+    take_seat,
+    utcnow,
+)
 from bot.schedule_source import build_schedule_source
 from bot.sync import sync_schedule
-from bot.texts import ASK_SURNAME, HELP, START, SURNAME_BAD, lab_card, queues_text
+from bot.texts import (
+    ASK_SURNAME,
+    GIVE_BAD,
+    GIVE_CANCELLED,
+    GIVE_CLOSED,
+    GIVE_MISSING,
+    GIVE_SELF,
+    GIVE_UNDELIVERED,
+    HELP,
+    INVITE_STALE,
+    MANY_SEATS,
+    SEAT_HINT,
+    START,
+    SURNAME_BAD,
+    at_username,
+    give_ask,
+    give_sent,
+    give_unknown,
+    invite_accepted_from,
+    invite_accepted_to,
+    invite_declined_from,
+    invite_declined_to,
+    invite_text,
+    invite_withdrawn,
+    lab_card,
+    lab_preview,
+    left_notice,
+    person_label,
+    queues_text,
+)
 from bot.users import has_surname, resolve_group_chat_id, set_state
 
 router = Router()
@@ -58,9 +97,18 @@ class Register(StatesGroup):
     last_name = State()
 
 
+class Handoff(StatesGroup):
+    username = State()
+
+
 class NeedSurname(Filter):
     async def __call__(self, event: Message | CallbackQuery, db_user: User) -> bool:
+        if isinstance(event, CallbackQuery) and (event.data or "").startswith(("iok:", "ino:")):
+            return False
         return not has_surname(db_user)
+
+
+USERNAME_RE = re.compile(r"^@?[A-Za-z][A-Za-z0-9_]{4,31}$")
 
 
 def parse_surname(text: str) -> str | None:
@@ -85,20 +133,42 @@ def _upcoming_query():
     )
 
 
+TELEGRAM_TEXT_LIMIT = 3500
+
+
+async def _answer_chunks(message: Message, text: str, reply_markup=None) -> None:
+    chunks: list[str] = []
+    current: list[str] = []
+    size = 0
+    for block in text.split("\n\n"):
+        extra = len(block) + (2 if current else 0)
+        if current and size + extra > TELEGRAM_TEXT_LIMIT:
+            chunks.append("\n\n".join(current))
+            current = [block]
+            size = len(block)
+        else:
+            current.append(block)
+            size += extra
+    if current:
+        chunks.append("\n\n".join(current))
+    for index, chunk in enumerate(chunks):
+        markup = reply_markup if index == len(chunks) - 1 else None
+        await message.answer(chunk, parse_mode="HTML", reply_markup=markup)
+
+
 async def _send_labs(message: Message, session: AsyncSession, settings: Settings) -> None:
     labs = list(await session.scalars(_upcoming_query()))
     if not labs:
         await message.answer("Ближайших лабораторных пока нет. Расписание подтянется после /sync.")
         return
     can_sign = {lab.id: signup_is_open(lab) for lab in labs}
-    lines = ["<b>Ближайшие лабораторные</b>\n"]
+    lines = ["<b>Ближайшие лабораторные</b>"]
     for lab in labs:
-        status = "запись открыта" if can_sign[lab.id] else "ожидает открытия"
-        lines.append(f"{lab_card(lab, settings.tz)}\nСтатус: {status}\n")
-    await message.answer(
-        "\n".join(lines),
-        parse_mode="HTML",
-        reply_markup=labs_keyboard(labs, can_sign=can_sign),
+        lines.append(lab_preview(lab, settings.tz, open_signup=can_sign[lab.id]))
+    await _answer_chunks(
+        message,
+        "\n\n".join(lines),
+        labs_keyboard(labs, can_sign=can_sign, tz=settings.tz),
     )
 
 
@@ -146,11 +216,34 @@ async def _show_seats(
         kind = default_kind(lab, settings.tz)
         spec = spec_by_kind(lab, kind, settings.tz)
     title = spec.title if spec else "Очередь"
-    text = f"{lab_card(lab, settings.tz)}\n\n<b>{title}</b>\nВыберите свободное место:"
+    text = f"{lab_card(lab, settings.tz)}\n\n<b>{title}</b>\nВыберите свободное место.\n{SEAT_HINT}"
     if notice:
         text = f"{notice}\n\n{text}"
     markup = seats_keyboard(lab, db_user.id, kind) if signup_is_open(lab) else None
     await _edit_or_send(query, text, markup)
+
+
+def _queue_title(lab: Lab, kind: str, settings: Settings) -> str:
+    spec = spec_by_kind(lab, kind, settings.tz)
+    if spec and has_dual_queues(lab, settings.tz):
+        return spec.title
+    return "Очередь"
+
+
+async def _tell(bot: Bot, tg_id: int, text: str, reply_markup=None) -> bool:
+    try:
+        await bot.send_message(tg_id, text, parse_mode="HTML", reply_markup=reply_markup)
+    except (TelegramForbiddenError, TelegramBadRequest):
+        return False
+    return True
+
+
+async def _tell_withdrawn(bot: Bot, session: AsyncSession, invites: list[SeatInvite], giver: User) -> None:
+    for invite in invites:
+        user = await session.get(User, invite.to_user_id)
+        if user is None:
+            continue
+        await _tell(bot, user.tg_id, invite_withdrawn(person_label(giver), invite.place))
 
 
 @router.message(CommandStart())
@@ -212,6 +305,83 @@ async def save_surname(
     await state.clear()
     await message.answer(f"Фамилия сохранена: <b>{surname}</b>", parse_mode="HTML")
     await _send_labs(message, session, settings)
+
+
+@router.message(Handoff.username, F.text)
+async def take_handoff_username(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+    db_user: User,
+    state: FSMContext,
+) -> None:
+    raw = (message.text or "").strip()
+    if raw.startswith("/"):
+        await state.clear()
+        command = raw.split()[0].split("@")[0]
+        if command == "/labs":
+            await _send_labs(message, session, settings)
+            return
+        if command == "/help":
+            await message.answer(HELP)
+            return
+        if command == "/my":
+            await cmd_my(message, session, db_user, settings)
+            return
+        await message.answer(GIVE_CANCELLED)
+        return
+    if not USERNAME_RE.fullmatch(raw):
+        await message.answer(GIVE_BAD)
+        return
+    data = await state.get_data()
+    try:
+        lab_id = int(data["lab_id"])
+        place = int(data["place"])
+        kind = str(data["kind"])
+    except (KeyError, TypeError, ValueError):
+        await state.clear()
+        await message.answer(GIVE_MISSING)
+        return
+    username = raw.removeprefix("@")
+    recipient = await session.scalar(
+        select(User).where(func.lower(User.username) == username.lower(), User.is_active.is_(True))
+    )
+    if recipient is None:
+        await message.answer(give_unknown(f"@{username}"))
+        return
+    if recipient.id == db_user.id:
+        await message.answer(GIVE_SELF)
+        return
+    lab = await get_lab(session, lab_id)
+    if lab is None:
+        await state.clear()
+        await message.answer(GIVE_MISSING)
+        return
+    status, invite, old = await create_invite(
+        session, lab.id, db_user.id, recipient.id, place, kind
+    )
+    if status == "closed":
+        await state.clear()
+        await message.answer(GIVE_CLOSED)
+        return
+    if status != "ok" or invite is None:
+        await state.clear()
+        await message.answer(GIVE_MISSING)
+        return
+    sent = await _tell(
+        message.bot,
+        recipient.tg_id,
+        invite_text(person_label(db_user), place, _queue_title(lab, kind, settings), lab_card(lab, settings.tz)),
+        invite_keyboard(invite.id),
+    )
+    if not sent:
+        await cancel_invite(session, invite.id)
+        await message.answer(GIVE_UNDELIVERED)
+        await _tell_withdrawn(message.bot, session, old, db_user)
+        return
+    await state.clear()
+    await message.answer(give_sent(at_username(recipient), place), parse_mode="HTML")
+    await _tell_withdrawn(message.bot, session, old, db_user)
 
 
 @router.message(NeedSurname())
@@ -318,6 +488,7 @@ async def cb_seat(
     session: AsyncSession,
     db_user: User,
     settings: Settings,
+    bot: Bot,
 ) -> None:
     if query.data is None:
         await query.answer()
@@ -341,10 +512,10 @@ async def cb_seat(
         await query.answer("Такой очереди нет", show_alert=True)
         return
     try:
-        status, place = await take_seat(session, lab, db_user, int(place_raw), kind)
+        status, place, cancelled = await take_seat(session, lab, db_user, int(place_raw), kind)
     except IntegrityError:
         await session.rollback()
-        status, place = "taken", None
+        status, place, cancelled = "taken", None, []
     lab = await get_lab(session, lab.id) or lab
     spec = spec_by_kind(lab, kind, settings.tz)
     queue_note = f" ({spec.short})" if spec and has_dual_queues(lab, settings.tz) else ""
@@ -369,9 +540,15 @@ async def cb_seat(
             kind,
             notice=f"Теперь вы на <b>{place}</b> месте{queue_note}.",
         )
+        await _tell_withdrawn(bot, session, cancelled, db_user)
         return
-    if status == "already":
-        await query.answer(f"Это уже ваше место: {place}")
+    if status == "left":
+        await query.answer(f"Вы снялись с {place} места")
+        await _show_seats(query, lab, db_user, settings, kind, notice=left_notice(place or 0))
+        await _tell_withdrawn(bot, session, cancelled, db_user)
+        return
+    if status == "many":
+        await query.answer(MANY_SEATS, show_alert=True)
         return
     if status == "taken":
         await query.answer("Это место уже заняли", show_alert=True)
@@ -381,6 +558,104 @@ async def cb_seat(
         await query.answer("Такого места нет", show_alert=True)
         return
     await query.answer("Запись сейчас закрыта", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("give:"))
+async def cb_give(
+    query: CallbackQuery,
+    session: AsyncSession,
+    db_user: User,
+    settings: Settings,
+    state: FSMContext,
+) -> None:
+    if query.data is None:
+        await query.answer()
+        return
+    _, lab_raw, kind, place_raw = query.data.split(":", 3)
+    lab = await get_lab(session, int(lab_raw))
+    place = int(place_raw)
+    if lab is None:
+        await query.answer("Лабораторная не найдена", show_alert=True)
+        return
+    owns = any(
+        entry.user_id == db_user.id and entry.queue_kind == kind and entry.place == place
+        for entry in lab.queue_entries
+    )
+    if not owns:
+        await query.answer(GIVE_MISSING, show_alert=True)
+        return
+    if not signup_is_open(lab):
+        await query.answer(GIVE_CLOSED, show_alert=True)
+        return
+    await state.set_state(Handoff.username)
+    await state.update_data(lab_id=lab.id, kind=kind, place=place)
+    await query.answer()
+    if query.message:
+        await query.message.answer(
+            give_ask(place, _queue_title(lab, kind, settings)),
+            parse_mode="HTML",
+        )
+
+
+async def _finish_invite(
+    query: CallbackQuery,
+    text: str,
+) -> None:
+    await query.answer()
+    if query.message is None:
+        return
+    try:
+        await query.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[]),
+        )
+    except TelegramBadRequest:
+        await query.message.answer(text, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("iok:"))
+async def cb_accept_invite(
+    query: CallbackQuery,
+    session: AsyncSession,
+    db_user: User,
+    settings: Settings,
+    bot: Bot,
+) -> None:
+    if query.data is None:
+        await query.answer()
+        return
+    status, invite = await accept_invite(session, int(query.data.split(":", 1)[1]), db_user.id)
+    if status != "accepted" or invite is None:
+        await query.answer(INVITE_STALE, show_alert=True)
+        return
+    lab = await get_lab(session, invite.lab_id)
+    queue = _queue_title(lab, invite.queue_kind, settings) if lab is not None else "Очередь"
+    card = lab_card(lab, settings.tz) if lab is not None else ""
+    await _finish_invite(query, invite_accepted_to(invite.place, queue, card))
+    giver = await session.get(User, invite.from_user_id)
+    if giver is not None:
+        await _tell(bot, giver.tg_id, invite_accepted_from(at_username(db_user), invite.place))
+
+
+@router.callback_query(F.data.startswith("ino:"))
+async def cb_decline_invite(
+    query: CallbackQuery,
+    session: AsyncSession,
+    db_user: User,
+    bot: Bot,
+) -> None:
+    if query.data is None:
+        await query.answer()
+        return
+    status, invite = await decline_invite(session, int(query.data.split(":", 1)[1]), db_user.id)
+    if status != "declined" or invite is None:
+        await query.answer(INVITE_STALE, show_alert=True)
+        return
+    await _finish_invite(query, invite_declined_to(invite.place))
+    giver = await session.get(User, invite.from_user_id)
+    if giver is not None:
+        await _tell(bot, giver.tg_id, invite_declined_from(at_username(db_user), invite.place))
 
 
 @router.callback_query(F.data.startswith("busy:"))

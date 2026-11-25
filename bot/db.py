@@ -40,6 +40,7 @@ async def init_db(settings: Settings) -> async_sessionmaker[AsyncSession]:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_migrate_queue_kind)
+        await conn.run_sync(_drop_one_seat_per_user)
         await conn.execute(text("PRAGMA journal_mode=WAL"))
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     return session_factory
@@ -80,6 +81,62 @@ def _migrate_queue_kind(connection) -> None:
     connection.execute(text("ALTER TABLE queue_entries_new RENAME TO queue_entries"))
     connection.execute(text("CREATE INDEX ix_queue_entries_lab_id ON queue_entries(lab_id)"))
     connection.execute(text("CREATE INDEX ix_queue_entries_user_id ON queue_entries(user_id)"))
+
+
+def _drop_one_seat_per_user(connection) -> None:
+    if not _has_user_queue_unique(connection):
+        return
+    connection.execute(
+        text(
+            """
+            CREATE TABLE queue_entries_multi (
+                id INTEGER PRIMARY KEY,
+                lab_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                place INTEGER NOT NULL,
+                queue_kind VARCHAR(16) NOT NULL DEFAULT 'main',
+                signed_at DATETIME NOT NULL,
+                FOREIGN KEY(lab_id) REFERENCES labs(id),
+                FOREIGN KEY(user_id) REFERENCES users(id),
+                UNIQUE(lab_id, queue_kind, place)
+            )
+            """
+        )
+    )
+    connection.execute(
+        text(
+            """
+            INSERT INTO queue_entries_multi (id, lab_id, user_id, place, queue_kind, signed_at)
+            SELECT id, lab_id, user_id, place, queue_kind, signed_at FROM queue_entries
+            """
+        )
+    )
+    connection.execute(text("DROP TABLE queue_entries"))
+    connection.execute(text("ALTER TABLE queue_entries_multi RENAME TO queue_entries"))
+    connection.execute(text("CREATE INDEX ix_queue_entries_lab_id ON queue_entries(lab_id)"))
+    connection.execute(text("CREATE INDEX ix_queue_entries_user_id ON queue_entries(user_id)"))
+
+
+def _has_user_queue_unique(connection) -> bool:
+    sql = connection.execute(
+        text("SELECT sql FROM sqlite_master WHERE type='table' AND name='queue_entries'")
+    ).scalar()
+    if not sql:
+        return False
+    compact = "".join(sql.split())
+    if "UNIQUE(lab_id,user_id,queue_kind)" in compact:
+        return True
+    rows = connection.execute(text("PRAGMA index_list('queue_entries')")).fetchall()
+    for row in rows:
+        if not row[2]:
+            continue
+        cols = [
+            info[2]
+            for info in connection.execute(text(f"PRAGMA index_info('{row[1]}')"))
+        ]
+        if cols == ["lab_id", "user_id", "queue_kind"]:
+            return True
+    return False
 
 
 def get_session_factory() -> async_sessionmaker[AsyncSession]:
